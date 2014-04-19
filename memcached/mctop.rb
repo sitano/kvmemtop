@@ -21,18 +21,19 @@ EXPIRY = 14 * 24 * 60 * 60
 
 SLAB_FIELDS = { # minimum width: 115 characters; 140+ to make the bar look good
   :size         => { :title => "CL", :width => 7, :justify => :left }, # item size b
-  :slab         => { :title => "PAGE#MB", :width => 7 },            # number of pages
+  :slab         => { :title => "PAGE(#)", :width => 7 },            # number of pages
   :item         => { :title => "ITEM(#)", :width => 11 },           # absolute number of items
-  :item_pct     => { :title => "UTIL(%)", :width => 11 },        # slab utilization
-  :data_pct     => { :title => "KEYVAL(%)", :width => 11 },      # effective use of items
+  :item_pct     => { :title => "UTIL(%)", :width => 11 },           # slab utilization
+  :data_pct     => { :title => "KEYVAL(%)", :width => 11 },         # effective use of items
   # :payload_pct is not supported by memcached stats
-  # :payload_pct  => { :title => "VALUE(%)", :width => 11 },       # value/(key+value) ratio
-  :expire       => { :title => "REC(/s)", :width => 8 },
-  :evict        => { :title => "EVT(/s)", :width => 8 },
-  :slab_evict   => { :title => "SEVT(/s)", :width => 9 },       # slab eviction
-  :locate       => { :title => "LOCATE(/s)", :width => 11 },
-  :insert       => { :title => "INSERT(/s)", :width => 11 },
-  :bar          => { :title => " ", :width => 0 },              # mem util/allocation bar
+  # :payload_pct  => { :title => "VALUE(%)", :width => 11 },        # value/(key+value) ratio
+  :expire       => { :title => "REC(/s)", :width => 8 },            # item expired/s
+  :evict        => { :title => "EVT(/s)", :width => 8 },            # item evicted/s
+  # :slab_evict is not supposted by memcached stats
+  # :slab_evict   => { :title => "SEVT(/s)", :width => 9 },         # slab eviction
+  :read         => { :title => "READ(/s)", :width => 11 },          # amount of read ops/s
+  :write        => { :title => "WRITE(/s)", :width => 11 },         # amount of write ops/s
+  :bar          => { :title => " ", :width => 0 },                  # mem util/allocation bar
 }
 
 HOST_FIELDS = { # minimum width: 140 characters, if this is too wide remove the REQ fields
@@ -73,10 +74,10 @@ CMD_READ = [
   :get, :gets,
 ]
 CMD_SUCCESS = [
-  :set, :cas, :add, :replace, :append, :prepend, :incr, :decr,
+  :get, :set, :flush, :touch,
 ]
 CMD_HITMISS = [
-  :cas, :replace, :append, :prepend, :incr, :decr, :get, :gets, :delete,
+  :get, :delete, :incr, :decr, :cas, :touch,
 ]
 CMD_EXIST = [
   :cas, :add,
@@ -90,8 +91,7 @@ SLAB_ORDER = [
                                           # memory
               :bar,                       # allocated memory
               :expire, :evict,            # item
-              :slab_evict,                # slab
-              :locate, :insert,           # command
+              :read, :write,              # command
              ]
 HOST_ORDER = [
               :host,                      # name
@@ -229,11 +229,25 @@ class ServerStats
     # slab stats
     mc.write("stats slabs\r\n")
     slab_data = []
+    active_slabs = 0
+    total_malloced = 0
     while (line = mc.gets) !~ /^END/
       if line =~ /^STAT (\d+):(\S+) (-?\d+)/
         while slab_data.size <= $1.to_i
           slab_data << {}
         end
+        slab_data[$1.to_i][$2] = $3.to_i
+      elsif line =~ /^STAT active_slabs (\d+)/
+        active_slabs = $1.to_i
+      elsif line =~ /^STAT total_malloced (\d+)/
+        total_malloced = $1.to_i
+      end
+    end
+
+    # items stats
+    mc.write("stats items\r\n")
+    while (line = mc.gets) !~ /^END/
+      if line =~ /^STAT items:(\d+):(\S+) (-?\d+)/
         slab_data[$1.to_i][$2] = $3.to_i
       end
     end
@@ -244,7 +258,7 @@ class ServerStats
       @cmds[:error][cmd] = stats_data[cmd.id2name + "_error"].to_i
     end
     CMD_SUCCESS.each do |cmd|
-      @cmds[:success][cmd] = stats_data[cmd.id2name + "_success"].to_i
+      @cmds[:success][cmd] = stats_data["cmd_" + cmd.id2name].to_i
     end
     CMD_HITMISS.each do |cmd|
       @cmds[:hit][cmd] = stats_data[cmd.id2name + "_hits"].to_i
@@ -257,17 +271,22 @@ class ServerStats
     @stats = {
       :uptime         => stats_data["uptime"].to_i,
       :latency        => elapsed,
-      :data           => stats_data["data_curr"].to_i,
-      :maxbytes       => stats_setting["maxbytes"].to_i,
-      :conn           => stats_data["conn_curr"].to_i,
+      :data           => stats_data["bytes"].to_i,
+      :maxbytes       => stats_data["limit_maxbytes"].to_i,
+      :conn           => stats_data["curr_connections"].to_i,
       :req            => CMD.inject(0) { |n, c| n += @cmds[:count][c] },
-      :expire         => stats_data["item_expire"].to_i,
-      :evict          => stats_data["item_evict"].to_i,
-      :rdata          => stats_data["data_read"].to_i,
-      :wdata          => stats_data["data_written"].to_i,
+      :expire         => stats_data["expired_unfetched"].to_i,
+      :evict          => stats_data["evictions"].to_i,
+      :rdata          => stats_data["bytes_read"].to_i,
+      :wdata          => stats_data["bytes_written"].to_i,
       :svrerr         => stats_data["server_error"].to_i,
-      :timestamp      => stats_data["aggregate_ts"].to_f,
+      :timestamp      => stats_data["time"].to_f,
+      :citem          => stats_data["curr_items"].to_i,
+      :titem          => stats_data["total_items"].to_i,
+      :malloced       => total_malloced,
+      :slabs          => active_slabs,
     }
+
     slab_data.each do |d|
       next if d.empty?
       @slabs[d["chunk_size"]] = {
@@ -278,18 +297,19 @@ class ServerStats
         # current slabs (memcached pages count allocated for slab class)
         :page_curr    => d["total_pages"],
         # items evicted
-        :evict        => 0, # TODO: d["item_evict"],
-        # slabs evicted
-        :slab_evict   => 0,
+        :evict        => d["evicted"],
+        # slabs evicted - NOT SUPPORTED
+        # :slab_evict   => 0,
         # items expired
-        :expire       => 0, # TODO: d["item_expire"],
+        :expire       => d["expired_unfetched"],
         # hitmisses unsupported per slab
-        :locate       => 0,
+        :read         => CMD_READ.inject(0) { |n, c| n += d["cmd_" + c.id2name].to_i } +
+                         CMD_READ.inject(0) { |n, c| n += d[c.id2name + "_hits"].to_i },
         # success hits per slab
-        :insert       => 0, # CMD_SUCCESS.inject(0) { |n, c| n += d[c.id2name + "_hits"] },
+        :write        => CMD_WRITE.inject(0) { |n, c| n += d["cmd_" + c.id2name].to_i } +
+                         CMD_WRITE.inject(0) { |n, c| n += d[c.id2name + "_hits"].to_i },
       } if d["chunk_size"]
     end
-    puts @slabs
   rescue => e
     # ignore
   end
@@ -604,20 +624,20 @@ def dump_slabs(slabs, last_slabs=nil)
       rate = {}
       timespan_sec = slab[:timestamp] - last_slabs[k][:timestamp]
       rate[:evict] = (slab[:evict] - last_slab[:evict]).to_f / timespan_sec
-      rate[:slab_evict] = (slab[:slab_evict] - last_slab[:slab_evict]).to_f / timespan_sec
+      #rate[:slab_evict] = (slab[:slab_evict] - last_slab[:slab_evict]).to_f / timespan_sec
       rate[:expire] = (slab[:expire] - last_slab[:expire]).to_f / timespan_sec
-      rate[:locate] = (slab[:locate] - last_slab[:locate]).to_f / timespan_sec
-      rate[:insert] = (slab[:insert] - last_slab[:insert]).to_f / timespan_sec
+      rate[:read]   = (slab[:read] - last_slab[:read]).to_f / timespan_sec
+      rate[:write]  = (slab[:write] - last_slab[:write]).to_f / timespan_sec
       rates[k] =rate
     end
   else
     slabs.each do |k, slab|
       rate = {}
       rate[:evict] = slab[:evict]
-      rate[:slab_evict] = slab[:slab_evict]
+      #rate[:slab_evict] = slab[:slab_evict]
       rate[:expire] = slab[:expire]
-      rate[:locate] = slab[:locate]
-      rate[:insert] = slab[:insert]
+      rate[:read]   = slab[:read]
+      rate[:write]  = slab[:write]
       rates[k] =rate
     end
   end
@@ -643,12 +663,12 @@ def dump_slabs(slabs, last_slabs=nil)
       :item         => v[:item_curr].to_h,
       :item_pct     => ("%3.1f%%" % item_ratio),
       :data_pct     => ("%3.1f%%" % data_ratio),
-    #  :payload_pct  => ("%3.1f%%" % payload_ratio),
+      #:payload_pct  => ("%3.1f%%" % payload_ratio),
       :expire       => "%7.1f" % rate[:expire],
       :evict        => "%7.1f" % rate[:evict],
-      :slab_evict   => "%7.1f" % rate[:slab_evict],
-      :locate       => "%7.1f" % rate[:locate],
-      :insert       => "%7.1f" % rate[:insert],
+      #:slab_evict   => "%7.1f" % rate[:slab_evict],
+      :read         => "%7.1f" % rate[:read],
+      :write        => "%7.1f" % rate[:write],
       :bar          => (" " + bar + " "),
     }
     SLAB_ORDER.inject("") { |line, field| line + row[field].rjust(SLAB_FIELDS[field][:width]) }
@@ -664,9 +684,9 @@ def dump_slabs(slabs, last_slabs=nil)
     #:payload_pct  => NA,
     :expire       => rates.inject(0) { |m, (k, r)| m + r[:expire] }.to_i.to_h,
     :evict        => rates.inject(0) { |m, (k, r)| m + r[:evict] }.to_i.to_h,
-    :slab_evict   => rates.inject(0) { |m, (k, r)| m + r[:slab_evict] }.to_i.to_h,
-    :locate       => rates.inject(0) { |m, (k, r)| m + r[:locate] }.to_i.to_h,
-    :insert       => rates.inject(0) { |m, (k, r)| m + r[:insert] }.to_i.to_h,
+    #:slab_evict   => rates.inject(0) { |m, (k, r)| m + r[:slab_evict] }.to_i.to_h,
+    :read         => rates.inject(0) { |m, (k, r)| m + r[:read] }.to_i.to_h,
+    :write        => rates.inject(0) { |m, (k, r)| m + r[:write] }.to_i.to_h,
     :bar          => (" " + bar + " "),
   }
   $buf.rows << SLAB_ORDER.inject("") { |line, field| line + row[field].rjust(SLAB_FIELDS[field][:width]) }
