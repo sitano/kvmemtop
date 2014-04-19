@@ -93,7 +93,7 @@ SLAB_ORDER = [
              ]
 HOST_ORDER = [
               :host,                      # name
-	          :uptime,		              # uptime
+              :uptime,                            # uptime
               :util, :conn,               # usage
               :latency,                   # responsiveness
               :expire, :evict,            # churning
@@ -374,8 +374,12 @@ module Screen
         terminfo = `stty -a`
         if terminfo =~ /rows (\d+)/
           @rows = $1.to_i
+        elsif terminfo =~ /(\d+) rows/
+          @rows = $1.to_i
         end
         if terminfo =~ /columns (\d+)/
+          @cols = $1.to_i
+        elsif terminfo =~ /(\d+) columns/
           @cols = $1.to_i
         end
       end
@@ -529,13 +533,21 @@ end
 
 def build_headers(left_header, fields, field_definitions)
   current_time = Time.now.strftime("%H:%M:%S")
-  $buf.headers = []
-  padding = " " * (Screen.cols - current_time.text_size - left_header.text_size - 1)
-  $buf.headers << left_header + padding + current_time
+
+  # Precalculate fields width
   field_widths = fields.inject(0) { |sum, field| sum + field_definitions[field][:width] }
+  # Detect max to pad to
+  screen_cols  = [Screen.cols, field_widths + 3].max
+
+  $buf.headers = []
+  padding_size = (screen_cols - current_time.text_size - left_header.text_size - 1)
+  padding_size = 1 unless padding_size >= 0
+  padding = " " * padding_size
+  $buf.headers << left_header + padding + current_time
+
   # this only works if no more than one field is springy (width = 0)
   field_definitions.each do |name, field_definition|
-    field_definition[:width] = Screen.cols - field_widths - 3 if field_definition[:width] == 0
+    field_definition[:width] = screen_cols - field_widths - 3 if field_definition[:width] == 0
   end
   field_widths = fields.inject(0) { |sum, field| sum + field_definitions[field][:width] }
   # left-justify the first field header
@@ -546,7 +558,7 @@ def build_headers(left_header, fields, field_definitions)
       line + field_definitions[field][:title].rjust(field_definitions[field][:width])
     end
   end
-  $buf.headers << (line + " " * (Screen.cols - field_widths - 1)).reverse
+  $buf.headers << (line + " " * (screen_cols - field_widths - 1)).reverse
 end
 
 def build_row(row, fields, field_definitions)
@@ -571,7 +583,7 @@ def dump_slabs(slabs, last_slabs=nil)
     s[:mem_used] = k * s[:item_curr]
   end
   mem_max = slabs.map { |k, s| s[:mem_total] }.max
-  if mem_max.zero?
+  if mem_max.nil? or mem_max.zero?
     mem_max = 1 # to render the in slab view properly
   end
 
