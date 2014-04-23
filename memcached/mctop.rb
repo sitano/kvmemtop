@@ -27,7 +27,7 @@ SLAB_FIELDS = { # minimum width: 115 characters; 140+ to make the bar look good
   :data_pct     => { :title => "KEYVAL(%)", :width => 11 },         # effective use of items
   # :payload_pct is not supported by memcached stats
   # :payload_pct  => { :title => "VALUE(%)", :width => 11 },        # value/(key+value) ratio
-  :expire       => { :title => "REC(/s)", :width => 8 },            # item expired/s
+  :expire       => { :title => "EXP(/s)", :width => 8 },            # item expired/s
   :evict        => { :title => "EVT(/s)", :width => 8 },            # item evicted/s
   # :slab_evict is not supposted by memcached stats
   # :slab_evict   => { :title => "SEVT(/s)", :width => 9 },         # slab eviction
@@ -253,20 +253,28 @@ class ServerStats
     end
 
     # commands related metrics
-    CMD.each do |cmd|
-      @cmds[:count][cmd] = stats_data[cmd.id2name].to_i
-      @cmds[:error][cmd] = stats_data[cmd.id2name + "_error"].to_i
-    end
     CMD_SUCCESS.each do |cmd|
       @cmds[:success][cmd] = stats_data["cmd_" + cmd.id2name].to_i
     end
     CMD_HITMISS.each do |cmd|
       @cmds[:hit][cmd] = stats_data[cmd.id2name + "_hits"].to_i
-      @cmds[:miss][cmd] = stats_data[cmd.id2name + "_miss"].to_i
+      @cmds[:miss][cmd] = stats_data[cmd.id2name + "_misses"].to_i
+    end
+    CMD.each do |cmd|
+      if CMD_HITMISS.include?(cmd) then
+        @cmds[:count][cmd] = (@cmds[:hit][cmd] + @cmds[:miss][cmd])
+      else
+        @cmds[:count][cmd] = 0
+      end
+      if stats_data.has_key?(cmd.id2name + "_badval") then
+        @cmds[:error][cmd] = stats_data[cmd.id2name + "_badval"].to_i
+      else
+        @cmds[:error][cmd] = 0
+      end
     end
     @cmds[:exist][:cas] = stats_data["cas_badval"].to_i
     @cmds[:exist][:add] = stats_data["add_exist"].to_i
-    @cmds[:timestamp] = stats_data["aggregate_ts"].to_f
+    @cmds[:timestamp] = stats_data["time"].to_f
 
     @stats = {
       :uptime         => stats_data["uptime"].to_i,
@@ -274,7 +282,7 @@ class ServerStats
       :data           => stats_data["bytes"].to_i,
       :maxbytes       => stats_data["limit_maxbytes"].to_i,
       :conn           => stats_data["curr_connections"].to_i,
-      :req            => CMD.inject(0) { |n, c| n += @cmds[:count][c] },
+      :req            => @cmds[:count].values().reduce(:+),
       :expire         => stats_data["expired_unfetched"].to_i,
       :evict          => stats_data["evictions"].to_i,
       :rdata          => stats_data["bytes_read"].to_i,
@@ -311,7 +319,7 @@ class ServerStats
       } if d["chunk_size"]
     end
   rescue => e
-    # ignore
+    abort("Error fetching data from host <#{host}>: #{e}\r")
   end
 end
 
@@ -359,10 +367,8 @@ class SummaryStats
           end
         end
       end
-      @cmds[:timestamp] += host_stats.cmds[:timestamp]
+      @cmds[:timestamp] = host_stats.cmds[:timestamp]
     end
-    #FIXME: getting timestamp this way doesn't really make sense
-    @cmds[:timestamp] /= @hosts.size
 
     # fix up age
     # FIXME: Again, none of the follwing really makes sense
@@ -432,7 +438,6 @@ module Screen
 
   end
 end
-
 
 # ----------
 
@@ -691,6 +696,8 @@ def dump_slabs(slabs, last_slabs=nil)
   }
   $buf.rows << SLAB_ORDER.inject("") { |line, field| line + row[field].rjust(SLAB_FIELDS[field][:width]) }
   display
+rescue => e
+  $stderr.puts("Error dumping slabs: #{e}\r")
 end
 
 def dump_hosts(hosts, last_hosts=nil)
@@ -761,6 +768,8 @@ def dump_hosts(hosts, last_hosts=nil)
   $buf.rows << build_row(row, HOST_ORDER, HOST_FIELDS)
 
   display
+rescue => e
+  $stderr.puts("Error dumping hosts: #{e}\r")
 end
 
 def dump_cmds(cmds, last_cmds=nil)
@@ -850,8 +859,8 @@ def dump_cmds(cmds, last_cmds=nil)
   if last_cmds
     read            = CMD_READ.inject(0.0) { |r, c| r += rates[:count][c] }
     write           = CMD_WRITE.inject(0.0) { |r, c| r += rates[:count][c] }
-    read_hit        = CMD_READ.inject(0.0) { |r, c| r += rates[:hit][c] }
-    write_success   = CMD_WRITE.inject(0.0) { |r, c| r += rates[:success][c] }
+    read_hit        = (CMD_READ & rates[:hit].keys).inject(0.0) { |r, c| r += rates[:hit][c] }
+    write_success   = (CMD_WRITE & rates[:success].keys).inject(0.0) { |r, c| r += rates[:success][c] }
     read_error      = CMD_READ.inject(0.0) { |r, c| r += rates[:error][c] }
     write_error     = CMD_WRITE.inject(0.0) { |r, c| r += rates[:error][c] }
 
@@ -891,9 +900,11 @@ def dump_cmds(cmds, last_cmds=nil)
   end
 
   display
+rescue => e
+  $stderr.puts("Error dumping cmds: #{e}\r")
 end
 
-def load_twemcache_config(filename)
+def load_memcache_config(filename)
   config = YAML.load_file(filename)
   blob = if config[$options[:env]]
     config[$options[:env]]
@@ -919,7 +930,7 @@ def parse_args
   }
 
   opts = OptionParser.new do |opts|
-    opts.banner = "Usage: mctop [options] [twemcache-config]"
+    opts.banner = "Usage: mctop [options] [memcache-config]"
 
     opts.on("-D", "--dev", "use development config") do
       $options[:env] = "development"
@@ -965,7 +976,7 @@ def parse_args
   end
 
   opts.parse!(ARGV)
-  load_twemcache_config(ARGV.shift) if ARGV.size > 0
+  load_memcache_config(ARGV.shift) if ARGV.size > 0
 end
 
 parse_args
